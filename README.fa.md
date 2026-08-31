@@ -50,8 +50,7 @@
 
 ### مراحل نصب
 
-#### ۱. دریافت کد
-```bash
+#### ۱. دری
 git clone https://github.com/mahanneman/vosk-voice-typing.git
 cd vosk-voice-typing
 ۲. نصب وابستگی‌ها
