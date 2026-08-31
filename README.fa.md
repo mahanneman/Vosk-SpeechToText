@@ -54,14 +54,14 @@
 git clone https://github.com/mahanneman/vosk-voice-typing.git
 cd vosk-voice-typing
 ۲. نصب وابستگی‌ها
-bash
+
 pip install -r requirements.txt
 توجه برای لینوکس: ممکن است نیاز به نصب portaudio و libportaudio2 داشته باشید:
 
-bash
+
 sudo apt install portaudio19-dev python3-pyaudio
 ۳. اجرای برنامه
-bash
+
 python Vosk_SpeechToText_v3.py
 🧭 راهنمای استفاده
 🔹 بار اول اجرا
@@ -131,7 +131,7 @@ Ctrl+Shift+L	تغییر زبان تشخیص (چرخه‌ای)
 📦 ساخت فایل اجرایی (اختیاری)
 برای ساخت فایل .exe (ویندوز) یا اجرایی در سایر سیستم‌ها می‌توانید از PyInstaller استفاده کنید:
 
-bash
+
 pip install pyinstaller
 pyinstaller --onefile --windowed --icon=icon.ico Vosk_SpeechToText_v3.py
 فایل icon.ico را می‌توانید از تصویر میکروفون موجود در کد بسازید یا از یک فایل جداگانه استفاده کنید.
@@ -139,7 +139,7 @@ pyinstaller --onefile --windowed --icon=icon.ico Vosk_SpeechToText_v3.py
 🐧 نکات مخصوص لینوکس
 برای دسترسی به میکروفون، مطمئن شوید کاربر شما در گروه audio قرار دارد:
 
-bash
+
 sudo usermod -a -G audio $USER
 در برخی توزیع‌ها ممکن است نیاز به نصب python3-pyqt5 و python3-pyqt5.qtsvg داشته باشید.
 
