@@ -1,4 +1,4 @@
-markdown
+
 [🇬🇧 English](README.md) | [🇮🇷 فارسی](README.fa.md)
 
 # 🎤 Vosk Voice Typing – تبدیل گفتار به متن با Vosk
