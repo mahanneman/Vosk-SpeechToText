@@ -54,18 +54,18 @@ Works offline, supports 20+ languages, floats above all windows, and includes sm
 ### Steps
 
 #### 1. Clone the repository
-```bash
+=============================================
 git clone https://github.com/mahanneman/vosk-voice-typing.git
 cd vosk-voice-typing
 2. Install dependencies
-bash
+
 pip install -r requirements.txt
 Linux users: You may need to install portaudio and libportaudio2 first:
 
-bash
+
 sudo apt install portaudio19-dev python3-pyaudio
 3. Run the application
-bash
+
 python Vosk_SpeechToText_v3.py
 🧭 How to Use
 First Run
@@ -131,7 +131,7 @@ These hotkeys work globally – the app does not need to be in focus.
 📦 Building an Executable (Optional)
 You can create a standalone executable (Windows, Linux, macOS) with PyInstaller:
 
-bash
+
 pip install pyinstaller
 pyinstaller --onefile --windowed --icon=icon.ico Vosk_SpeechToText_v3.py
 You can use the built‑in microphone icon from the code, or provide your own .ico file.
@@ -139,11 +139,11 @@ You can use the built‑in microphone icon from the code, or provide your own .i
 🐧 Linux‑Specific Notes
 To access the microphone, ensure your user is in the audio group:
 
-bash
+
 sudo usermod -a -G audio $USER
 Some distributions may require additional packages:
 
-bash
+
 sudo apt install python3-pyqt5 python3-pyqt5.qtsvg
 If audio is not captured, check your default input device in system settings or use pavucontrol.
 
