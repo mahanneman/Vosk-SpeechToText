@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-برنامه تبدیل گفتار به متن با Vosk - نسخه نهایی ۴.۲
+برنامه تبدیل گفتار به متن با Vosk - نسخه ۵.۰
 رفع خطاهای drawRoundedRect و setWindowIcon
 """
 
@@ -14,8 +14,13 @@ import socket
 import time
 import shutil
 import zipfile
+import base64
+import html
+import unicodedata
+from datetime import datetime
+from collections import Counter
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote, unquote
 
 import requests
 import sounddevice as sd
@@ -25,10 +30,10 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon, QMenu, QAction, QFrame, QComboBox, QRadioButton,
     QDialog, QProgressDialog, QMessageBox, QLineEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QTabWidget, QTextEdit, QFileDialog,
-    QGroupBox, QGridLayout, QCheckBox
+    QGroupBox, QGridLayout
 )
-from PyQt5.QtCore import Qt, QPoint, QSize, pyqtSignal, QObject, QTimer, QThread, QSettings
-from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush, QCursor
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QObject, QTimer, QThread, QSettings
+from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush
 from vosk import Model, KaldiRecognizer
 
 # =============================================
@@ -124,13 +129,7 @@ UI_STRINGS = {
         'delete_model': 'حذف مدل',
         'app_title': 'برنامه تبدیل گفتار به متن',
         'author': 'ساخته شده توسط MA.AD.GH',
-        'version': 'نسخه 3',
-        'auto_type': 'تایپ خودکار',
-        'clipboard_only': 'فقط کپی در کلیپ‌بورد',
-        'hover_expand': 'باز شدن خودکار با بردن ماوس',
-        'compact_mode': 'حالت آیکون شناور',
-        'expand_window': 'باز کردن پنجره',
-        'compact_tooltip': '<b>آیکون شناور</b><br>کلیک: باز کردن پنجره<br>راست‌کلیک: منوی سریع<br>کشیدن: جابه‌جایی',
+        'version': 'نسخه 5.0',
     },
     'en': {
         'wait_title': '⏳ Please wait...',
@@ -221,13 +220,7 @@ UI_STRINGS = {
         'delete_model': 'Delete Model',
         'app_title': 'Speech to Text',
         'author': 'Created by MA.AD.GH',
-        'version': 'Version 3',
-        'auto_type': 'Auto type',
-        'clipboard_only': 'Clipboard only',
-        'hover_expand': 'Expand on hover',
-        'compact_mode': 'Floating icon mode',
-        'expand_window': 'Show window',
-        'compact_tooltip': '<b>Floating icon</b><br>Click: open window<br>Right-click: quick menu<br>Drag: move',
+        'version': 'Version 5.0',
     }
 }
 
@@ -497,48 +490,98 @@ class ModelDownloader(QThread):
         super().__init__(); self.model_name=model_name; self.url=url; self.save_path=save_path; self._is_cancelled=False
     def cancel(self): self._is_cancelled=True
     def run(self):
-        temp_extract=None
+        temp_extract = None
+        stage_target = None
+        backup_target = None
         try:
+            if not re.fullmatch(r'vosk-model-[A-Za-z0-9._-]+', self.model_name) or '..' in self.model_name:
+                raise ValueError('Invalid model name')
             os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-            response=requests.get(self.url, stream=True, timeout=(10,60)); response.raise_for_status()
-            total=int(response.headers.get('content-length',0) or 0); downloaded=0; started=time.time(); speed=0.0
-            with open(self.save_path,'wb') as f:
-                for chunk in response.iter_content(chunk_size=128*1024):
-                    if self._is_cancelled:
-                        raise RuntimeError('Cancelled')
-                    if not chunk: continue
-                    f.write(chunk); downloaded += len(chunk)
-                    elapsed=max(time.time()-started,0.001); speed=downloaded/elapsed
-                    self.progress.emit(downloaded,total,format_size(speed)+'/s')
-                    if total and speed:
-                        self.eta_updated.emit(self.format_time((total-downloaded)/speed))
-            if self._is_cancelled: raise RuntimeError('Cancelled')
-            temp_extract=os.path.join(MODEL_DIR,'.extract-'+re.sub(r'[^A-Za-z0-9._-]','_',self.model_name))
-            if os.path.exists(temp_extract): shutil.rmtree(temp_extract, ignore_errors=True)
-            os.makedirs(temp_extract,exist_ok=True)
-            with zipfile.ZipFile(self.save_path,'r') as z:
-                base=os.path.abspath(temp_extract)+os.sep
-                for member in z.infolist():
-                    dest=os.path.abspath(os.path.join(temp_extract,member.filename))
-                    if not (dest+os.sep).startswith(base) and dest != base[:-1]:
+            downloaded = 0
+            started = time.time()
+            with requests.get(self.url, stream=True, timeout=(10, 60)) as response:
+                response.raise_for_status()
+                total = int(response.headers.get('content-length', 0) or 0)
+                with open(self.save_path, 'wb') as handle:
+                    for chunk in response.iter_content(chunk_size=128 * 1024):
+                        if self._is_cancelled:
+                            raise RuntimeError('Cancelled')
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        downloaded += len(chunk)
+                        speed = downloaded / max(time.time() - started, 0.001)
+                        self.progress.emit(downloaded, total, format_size(speed) + '/s')
+                        if total and speed > 0:
+                            self.eta_updated.emit(self.format_time((total - downloaded) / speed))
+            if self._is_cancelled:
+                raise RuntimeError('Cancelled')
+
+            safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', self.model_name)
+            temp_extract = os.path.join(MODEL_DIR, '.extract-' + safe_name)
+            stage_target = os.path.join(MODEL_DIR, '.stage-' + safe_name)
+            target = os.path.abspath(os.path.join(MODEL_DIR, self.model_name))
+            backup_target = target + '.backup'
+            for candidate in (temp_extract, stage_target):
+                if os.path.exists(candidate):
+                    shutil.rmtree(candidate, ignore_errors=True)
+            os.makedirs(temp_extract, exist_ok=True)
+
+            with zipfile.ZipFile(self.save_path, 'r') as archive:
+                base = os.path.abspath(temp_extract)
+                for member in archive.infolist():
+                    normalized = member.filename.replace('\\', '/')
+                    if normalized.startswith('/') or re.match(r'^[A-Za-z]:', normalized):
+                        raise ValueError('Unsafe absolute path in ZIP archive')
+                    parts = normalized.split('/')
+                    if '..' in parts:
+                        raise ValueError('Unsafe path traversal in ZIP archive')
+                    mode = (member.external_attr >> 16) & 0o170000
+                    if mode == 0o120000:
+                        raise ValueError('Symbolic links are not allowed in model archives')
+                    destination = os.path.abspath(os.path.join(temp_extract, *parts))
+                    if os.path.commonpath([base, destination]) != base:
                         raise ValueError('Unsafe path in ZIP archive')
-                z.extractall(temp_extract)
-            root=_model_root_from_path(temp_extract)
-            if not root: raise ValueError('Downloaded ZIP is not a valid Vosk ASR model (am/final.mdl missing)')
-            target=os.path.abspath(os.path.join(MODEL_DIR,self.model_name))
-            if os.path.exists(target): shutil.rmtree(target)
-            if os.path.abspath(root)==os.path.abspath(temp_extract):
-                os.replace(temp_extract,target); temp_extract=None
+                archive.extractall(temp_extract)
+
+            root = _model_root_from_path(temp_extract)
+            if not root:
+                raise ValueError('Downloaded ZIP is not a valid Vosk ASR model (am/final.mdl missing)')
+            if os.path.abspath(root) == os.path.abspath(temp_extract):
+                os.replace(temp_extract, stage_target)
+                temp_extract = None
             else:
-                shutil.move(root,target)
-            self.finished.emit(self.model_name,True,'Download complete')
-        except Exception as e:
-            self.finished.emit(self.model_name,False,str(e))
+                shutil.move(root, stage_target)
+            if not os.path.isfile(os.path.join(stage_target, 'am', 'final.mdl')):
+                raise ValueError('Staged model validation failed')
+            if self._is_cancelled:
+                raise RuntimeError('Cancelled')
+
+            # Preserve any existing good model until the replacement has been staged and validated.
+            if os.path.exists(backup_target):
+                shutil.rmtree(backup_target, ignore_errors=True)
+            if os.path.exists(target):
+                os.replace(target, backup_target)
+            try:
+                os.replace(stage_target, target)
+            except Exception:
+                if os.path.exists(backup_target) and not os.path.exists(target):
+                    os.replace(backup_target, target)
+                raise
+            if os.path.exists(backup_target):
+                shutil.rmtree(backup_target, ignore_errors=True)
+            self.finished.emit(self.model_name, True, 'Download complete')
+        except Exception as exc:
+            self.finished.emit(self.model_name, False, str(exc))
         finally:
             try:
-                if os.path.exists(self.save_path): os.remove(self.save_path)
-            except OSError: pass
-            if temp_extract and os.path.exists(temp_extract): shutil.rmtree(temp_extract,ignore_errors=True)
+                if os.path.exists(self.save_path):
+                    os.remove(self.save_path)
+            except OSError:
+                pass
+            for temp_path in (temp_extract, stage_target):
+                if temp_path and os.path.exists(temp_path):
+                    shutil.rmtree(temp_path, ignore_errors=True)
     @staticmethod
     def format_time(seconds):
         seconds=max(0,int(seconds))
@@ -580,16 +623,564 @@ class LocalModelImporter(QThread):
             self.finished.emit('',self.lang,False,str(e))
 
 # =============================================
+#  موتور ابزارهای عمومی متن و ابزارهای ویژه فارسی
+# =============================================
+PERSIAN_DIGITS = '۰۱۲۳۴۵۶۷۸۹'
+ARABIC_DIGITS = '٠١٢٣٤٥٦٧٨٩'
+ASCII_DIGITS = '0123456789'
+
+
+def _map_chars(text, source, target):
+    return str(text).translate(str.maketrans(source, target))
+
+
+def _linewise(text, fn):
+    return '\n'.join(fn(line) for line in str(text).splitlines())
+
+
+def _word_frequency(text):
+    words = re.findall(r'[^\W_]+', str(text).casefold(), flags=re.UNICODE)
+    counts = Counter(words)
+    if not counts:
+        return 'واژه‌ای برای شمارش پیدا نشد.'
+    return '\n'.join(f'{word}\t{count}' for word, count in counts.most_common(100))
+
+
+def _text_statistics(text):
+    text = str(text)
+    words = re.findall(r'\S+', text)
+    sentences = [x for x in re.split(r'[.!?؟。！？]+', text) if x.strip()]
+    paragraphs = [x for x in re.split(r'\n\s*\n', text) if x.strip()]
+    chars_no_space = sum(not c.isspace() for c in text)
+    minutes = max(1, round(len(words) / 220)) if words else 0
+    return (f'تعداد واژه/بخش‌های جداشده با فاصله: {len(words)}\n'
+            f'تعداد نویسه: {len(text)}\n'
+            f'تعداد نویسه بدون فاصله: {chars_no_space}\n'
+            f'تعداد خط: {len(text.splitlines())}\n'
+            f'تعداد جمله تقریبی: {len(sentences)}\n'
+            f'تعداد بند: {len(paragraphs)}\n'
+            f'زمان خواندن تقریبی با سرعت ۲۲۰ واژه در دقیقه: {minutes} دقیقه')
+
+
+def _strip_accents(text):
+    return ''.join(ch for ch in unicodedata.normalize('NFD', str(text))
+                   if unicodedata.category(ch) != 'Mn')
+
+
+def _remove_control_chars(text):
+    return ''.join(ch for ch in str(text) if ch in '\n\t' or unicodedata.category(ch)[0] != 'C')
+
+
+def _remove_emoji(text):
+    emoji_pattern = re.compile(
+        '['
+        '\U0001F300-\U0001FAFF'
+        '\U00002700-\U000027BF'
+        '\U00002600-\U000026FF'
+        '\U0001F1E6-\U0001F1FF'
+        ']+', flags=re.UNICODE)
+    return emoji_pattern.sub('', str(text))
+
+
+def _extract(pattern, text, flags=re.IGNORECASE):
+    matches = re.findall(pattern, str(text), flags=flags)
+    if not matches:
+        return 'موردی پیدا نشد.'
+    if matches and isinstance(matches[0], tuple):
+        matches = [''.join(m) for m in matches]
+    return '\n'.join(dict.fromkeys(str(x) for x in matches))
+
+
+def _sentence_case(text):
+    text = str(text).lower()
+    return re.sub(r'(^|[.!?؟]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), text)
+
+
+def _join_wrapped_lines(text):
+    text = str(text).replace('\r\n', '\n').replace('\r', '\n')
+    return re.sub(r'(?<![.!?؟:؛])\n(?!\s*\n)', ' ', text)
+
+
+def _normalize_punctuation_spacing(text):
+    text = re.sub(r'\s+([,.;:!?،؛؟])', r'\1', str(text))
+    text = re.sub(r'([,.;:!?،؛؟])(?=\S)', r'\1 ', text)
+    return re.sub(r'[ \t]{2,}', ' ', text)
+
+
+def _dedupe_adjacent_words(text):
+    return re.sub(r'\b([\w]+)(\s+\1\b)+', r'\1', str(text), flags=re.IGNORECASE)
+
+
+def _remove_punctuation(text):
+    return ''.join(ch for ch in str(text) if not unicodedata.category(ch).startswith('P'))
+
+
+def _sentence_lines(text):
+    parts = re.split(r'(?<=[.!?؟。！？])\s+', str(text).strip())
+    return '\n'.join(x.strip() for x in parts if x.strip())
+
+
+def _paragraph_numbering(text):
+    blocks = [x.strip() for x in re.split(r'\n\s*\n', str(text)) if x.strip()]
+    return '\n\n'.join(f'{i}. {block}' for i, block in enumerate(blocks, 1))
+
+
+def _general_features():
+    now = lambda: datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')
+    return [
+        ('پاک‌سازی فاصله‌های تکراری', lambda t: _linewise(t, lambda x: re.sub(r'[ \t]{2,}', ' ', x))),
+        ('حذف فاصله ابتدا و انتهای خط', lambda t: _linewise(t, str.strip)),
+        ('حذف خط‌های خالی', lambda t: '\n'.join(x for x in str(t).splitlines() if x.strip())),
+        ('کاهش چند خط خالی به یک خط', lambda t: re.sub(r'\n[ \t]*\n(?:[ \t]*\n)+', '\n\n', str(t))),
+        ('اتصال خط‌های شکسته متن', _join_wrapped_lines),
+        ('تبدیل به حروف بزرگ لاتین', lambda t: str(t).upper()),
+        ('تبدیل به حروف کوچک لاتین', lambda t: str(t).lower()),
+        ('حروف عنوانی لاتین', lambda t: str(t).title()),
+        ('بزرگ‌کردن آغاز جمله لاتین', _sentence_case),
+        ('یکسان‌سازی علامت نقل‌قول', lambda t: str(t).replace('“', '"').replace('”', '"').replace('„', '"').replace('’', "'").replace('‘', "'")),
+        ('اصلاح فاصله‌گذاری نشانه‌ها', _normalize_punctuation_spacing),
+        ('حذف واژه‌های تکراری متوالی', _dedupe_adjacent_words),
+        ('حذف خط‌های کاملاً تکراری', lambda t: '\n'.join(dict.fromkeys(str(t).splitlines()))),
+        ('مرتب‌سازی خط‌ها', lambda t: '\n'.join(sorted(str(t).splitlines(), key=str.casefold))),
+        ('معکوس‌کردن ترتیب خط‌ها', lambda t: '\n'.join(reversed(str(t).splitlines()))),
+        ('شماره‌گذاری خط‌ها', lambda t: '\n'.join(f'{i}. {x}' for i, x in enumerate(str(t).splitlines(), 1))),
+        ('نشانه‌گذاری خط‌ها با بولت', lambda t: '\n'.join(('• ' + x) if x.strip() else '' for x in str(t).splitlines())),
+        ('حذف نشانه‌های فهرست', lambda t: _linewise(t, lambda x: re.sub(r'^\s*(?:[-*•+] |\d+[.)]\s*)', '', x))),
+        ('تورفتگی چهار فاصله‌ای', lambda t: _linewise(t, lambda x: ('    ' + x) if x else x)),
+        ('حذف یک سطح تورفتگی', lambda t: _linewise(t, lambda x: re.sub(r'^(?:    |\t)', '', x))),
+        ('معکوس‌کردن کل متن', lambda t: str(t)[::-1]),
+        ('معکوس‌کردن ترتیب واژه‌ها در هر خط', lambda t: _linewise(t, lambda x: ' '.join(reversed(x.split())))),
+        ('مرتب‌سازی واژه‌های هر خط', lambda t: _linewise(t, lambda x: ' '.join(sorted(x.split(), key=str.casefold)))),
+        ('حذف نشانه‌گذاری‌ها', _remove_punctuation),
+        ('حذف تگ‌های HTML', lambda t: html.unescape(re.sub(r'<[^>]*>', '', str(t)))),
+        ('حذف نشانی‌های اینترنتی', lambda t: re.sub(r'https?://\S+|www\.\S+', '', str(t), flags=re.I)),
+        ('استخراج نشانی‌های اینترنتی', lambda t: _extract(r'https?://[^\s<>]+|www\.[^\s<>]+', t)),
+        ('استخراج ایمیل‌ها', lambda t: _extract(r'[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}', t)),
+        ('استخراج عددها', lambda t: _extract(r'(?<!\w)[+-]?\d+(?:[.,]\d+)?', t, flags=0)),
+        ('استخراج هشتگ‌ها', lambda t: _extract(r'(?<!\w)#[\w\u0600-\u06FF]+', t)),
+        ('استخراج شناسه‌های @', lambda t: _extract(r'(?<!\w)@[\w.]+', t)),
+        ('حذف شکلک‌ها', _remove_emoji),
+        ('حذف اعراب ترکیبی لاتین/عربی', _strip_accents),
+        ('گزارش فراوانی واژه‌ها', _word_frequency),
+        ('گزارش آمار متن', _text_statistics),
+        ('افزودن زمان در ابتدای متن', lambda t: f'[{now()}]\n{t}'),
+        ('افزودن زمان در انتهای متن', lambda t: f'{t}\n[{now()}]'),
+        ('تبدیل متن به عنوان Markdown', lambda t: '# ' + str(t).strip().replace('\n', ' ')),
+        ('تبدیل بندها به نقل‌قول Markdown', lambda t: '\n'.join('> ' + x if x.strip() else '>' for x in str(t).splitlines())),
+        ('قرار دادن متن در بلوک کد Markdown', lambda t: '```text\n' + str(t) + '\n```'),
+        ('رمزگذاری رشته به قالب JSON', lambda t: json.dumps(str(t), ensure_ascii=False)),
+        ('قالب‌بندی JSON', lambda t: json.dumps(json.loads(str(t)), ensure_ascii=False, indent=2)),
+        ('کدگذاری URL', lambda t: quote(str(t), safe='')),
+        ('رمزگشایی URL', lambda t: unquote(str(t))),
+        ('کدگذاری Base64 با UTF-8', lambda t: base64.b64encode(str(t).encode('utf-8')).decode('ascii')),
+        ('رمزگشایی Base64 با UTF-8', lambda t: base64.b64decode(str(t).strip(), validate=True).decode('utf-8')),
+        ('رمزگذاری نویسه‌های HTML', lambda t: html.escape(str(t))),
+        ('رمزگشایی نویسه‌های HTML', lambda t: html.unescape(str(t))),
+        ('تبدیل Tab به چهار فاصله', lambda t: str(t).replace('\t', '    ')),
+        ('تبدیل چهار فاصله به Tab', lambda t: str(t).replace('    ', '\t')),
+        ('یکسان‌سازی پایان خط‌ها', lambda t: str(t).replace('\r\n', '\n').replace('\r', '\n')),
+        ('قرار دادن هر جمله در خط مستقل', _sentence_lines),
+        ('شماره‌گذاری بندها', _paragraph_numbering),
+        ('کاهش نشانه‌گذاری تکراری', lambda t: re.sub(r'([!?.,؛،؟])\1{1,}', r'\1', str(t))),
+        ('تبدیل ارقام تمام‌عرض به لاتین', lambda t: ''.join(chr(ord(c) - 0xFEE0) if '\uff10' <= c <= '\uff19' else c for c in str(t))),
+        ('حذف نویسه‌های کنترلی نامرئی', _remove_control_chars),
+    ]
+
+
+def _persian_features():
+    def zwnj(t):
+        t = re.sub(r'\u200c{2,}', '\u200c', str(t))
+        return re.sub(r'\s*\u200c\s*', '\u200c', t)
+
+    def fix_mi(t):
+        return re.sub(r'(?<![\w\u0600-\u06FF])(نمی|می)\s+(?=[\u0600-\u06FF])', lambda m: m.group(1) + '\u200c', str(t))
+
+    def suffix(t, ending):
+        return re.sub(r'([\u0600-\u06FF]{2,})\s+' + ending + r'(?=\b|\s|$)', lambda m: m.group(1) + '\u200c' + ending, str(t))
+
+    def punctuation(t):
+        t = str(t).replace(',', '،').replace(';', '؛').replace('?', '؟')
+        t = re.sub(r'\s+([،؛؟.!])', r'\1', t)
+        t = re.sub(r'([،؛؟.!])(?=\S)', r'\1 ', t)
+        return re.sub(r'[ \t]{2,}', ' ', t)
+
+    def fix_common(t):
+        replacements = {
+            'مسول': 'مسئول', 'مسئله': 'مسئله', 'ظبط': 'ضبط',
+            'حتمن': 'حتماً', 'لطفا': 'لطفاً', 'اصلا': 'اصلاً',
+            'انشاالله': 'ان‌شاءالله', 'میباشد': 'است', 'می باشد': 'است',
+            'به عنوان': 'به‌عنوان', 'به صورت': 'به‌صورت', 'به خاطر': 'به‌خاطر',
+            'در باره': 'درباره', 'هم چنین': 'همچنین', 'بهره وری': 'بهره‌وری',
+        }
+        out = str(t)
+        for old, new in replacements.items():
+            out = re.sub(re.escape(old), new, out)
+        return out
+
+    def informal_to_formal(t):
+        replacements = {
+            'میخوام': 'می‌خواهم', 'میخواد': 'می‌خواهد', 'میگم': 'می‌گویم',
+            'میگن': 'می‌گویند', 'نمیتونم': 'نمی‌توانم', 'نمیتونه': 'نمی‌تواند',
+            'نمیشه': 'نمی‌شود', 'میشه': 'می‌شود', 'چیکار': 'چه‌کار',
+            'واسه': 'برای', 'اونا': 'آن‌ها', 'اینا': 'این‌ها',
+        }
+        out = str(t)
+        for old, new in replacements.items():
+            out = re.sub(r'(?<!\S)' + re.escape(old) + r'(?!\S)', new, out)
+        return out
+
+    def persian_stats(t):
+        t = str(t)
+        persian_chars = [c for c in t if '\u0600' <= c <= '\u06FF' and c.isalpha()]
+        letters = [c for c in t if c.isalpha()]
+        ratio = (100 * len(persian_chars) / max(1, len(letters)))
+        words = re.findall(r'[\u0600-\u06FF]+(?:\u200c[\u0600-\u06FF]+)*', t)
+        return (f'تعداد نویسه‌های محدوده عربی/فارسی: {len(persian_chars)}\n'
+                f'تعداد واژه‌های فارسی/عربی: {len(words)}\n'
+                f'سهم نویسه‌های این محدوده از حروف: {ratio:.1f}%')
+
+    return [
+        ('یکسان‌سازی «ي» و «ى» به «ی»', lambda t: str(t).replace('ي', 'ی').replace('ى', 'ی')),
+        ('یکسان‌سازی «ك» به «ک»', lambda t: str(t).replace('ك', 'ک')),
+        ('تبدیل ارقام لاتین به فارسی', lambda t: _map_chars(t, ASCII_DIGITS, PERSIAN_DIGITS)),
+        ('تبدیل ارقام فارسی به لاتین', lambda t: _map_chars(t, PERSIAN_DIGITS, ASCII_DIGITS)),
+        ('تبدیل ارقام عربی به فارسی', lambda t: _map_chars(t, ARABIC_DIGITS, PERSIAN_DIGITS)),
+        ('حذف اعراب عربی', lambda t: re.sub(r'[\u064B-\u065F\u0670]', '', str(t))),
+        ('حذف کشیده عربی', lambda t: str(t).replace('ـ', '')),
+        ('یکسان‌سازی «ھ» به «ه»', lambda t: str(t).replace('ھ', 'ه')),
+        ('یکسان‌سازی نشانه‌گذاری فارسی', punctuation),
+        ('تبدیل گیومه‌ها به «»', lambda t: re.sub(r'["“]([^"”]+)["”]', lambda m: '«' + m.group(1) + '»', str(t))),
+        ('اصلاح نیم‌فاصله‌های تکراری', zwnj),
+        ('افزودن نیم‌فاصله به پیشوند می/نمی', fix_mi),
+        ('افزودن نیم‌فاصله به پسوند جمع «ها»', lambda t: suffix(t, 'ها')),
+        ('افزودن نیم‌فاصله به پسوند «های»', lambda t: suffix(t, 'های')),
+        ('افزودن نیم‌فاصله به «تر» و «ترین»', lambda t: suffix(suffix(t, 'ترین'), 'تر')),
+        ('اصلاح ترکیب‌های رایج فارسی', fix_common),
+        ('تبدیل چند شکل محاوره‌ای رایج به رسمی', informal_to_formal),
+        ('یکسان‌سازی همزه در الف‌های عربی', lambda t: str(t).replace('أ', 'ا').replace('إ', 'ا')),
+        ('تبدیل «هٔ» به «ۀ»', lambda t: str(t).replace('هٔ', 'ۀ')),
+        ('حذف فاصله‌های قبل از نشانه‌ها', lambda t: re.sub(r'\s+([،؛؟.!])', r'\1', str(t))),
+        ('افزودن فاصله بعد از نشانه‌ها', lambda t: re.sub(r'([،؛؟.!])(?=\S)', r'\1 ', str(t))),
+        ('یکسان‌سازی سه‌نقطه', lambda t: re.sub(r'\.{2,}|…{2,}', '…', str(t))),
+        ('کاهش علامت‌های نگارشی تکراری', lambda t: re.sub(r'([،؛؟.!])\1+', r'\1', str(t))),
+        ('تبدیل ویرگول انگلیسی به فارسی', lambda t: str(t).replace(',', '،')),
+        ('تبدیل نقطه‌ویرگول انگلیسی به فارسی', lambda t: str(t).replace(';', '؛')),
+        ('قالب‌بندی فاصله‌گذاری فارسی', lambda t: zwnj(punctuation(t))),
+        ('گزارش شمارش واژه‌های فارسی', lambda t: f"تعداد واژه‌های فارسی: {len(re.findall(r'[\u0600-\u06FF]+(?:\u200c[\u0600-\u06FF]+)*', str(t)))}"),
+        ('گزارش فراوانی واژه‌های فارسی', lambda t: _word_frequency(' '.join(re.findall(r'[\u0600-\u06FF]+(?:\u200c[\u0600-\u06FF]+)*', str(t))))),
+        ('استخراج واژه‌ها و عبارت‌های فارسی', lambda t: _extract(r'[\u0600-\u06FF]+(?:\u200c[\u0600-\u06FF]+)*', t, flags=0)),
+        ('گزارش سهم خط فارسی/عربی', persian_stats),
+    ]
+
+
+class FeatureWorkbenchDialog(QDialog):
+    """ویرایشگر آفلاین متن با ۵۶ ابزار عمومی و ۳۰ ابزار اختصاصی فارسی."""
+    def __init__(self, parent=None, initial_text='', ui_lang='fa'):
+        super().__init__(parent)
+        self.ui_lang = ui_lang
+        self.setWindowTitle('کارگاه متن و ابزارهای گفتار' if ui_lang == 'fa' else 'Text & Dictation Workbench')
+        self.resize(850, 660)
+        self.setMinimumSize(680, 500)
+        self.setWindowFlags(self.windowFlags() | Qt.Window)
+        root = QVBoxLayout(self)
+        intro = QLabel('۵۶ ابزار عمومی متن چندزبانه + ۳۰ ابزار ویژه فارسی | آفلاین؛ ابزارهای شمارش واژه بر پایه فاصله‌اند.' if ui_lang == 'fa'
+                       else '56 multilingual text tools + 30 Persian tools | offline; word counters split on whitespace.')
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+        self.editor = QTextEdit(self)
+        self.editor.setAcceptRichText(False)
+        self.editor.setPlaceholderText('متن گفتار یا متن موردنظر را اینجا وارد کنید...' if ui_lang == 'fa' else 'Enter or paste text here...')
+        self.editor.setPlainText(initial_text or '')
+        self.editor.setLayoutDirection(Qt.RightToLeft if ui_lang == 'fa' else Qt.LeftToRight)
+        root.addWidget(self.editor, 1)
+
+        self.tabs = QTabWidget(self)
+        self.general_combo = QComboBox(self)
+        self.persian_combo = QComboBox(self)
+        self.general_actions = _general_features()
+        self.persian_actions = _persian_features()
+        for label, _ in self.general_actions:
+            self.general_combo.addItem(label)
+        for label, _ in self.persian_actions:
+            self.persian_combo.addItem(label)
+
+        general_tab = QWidget(self)
+        gl = QHBoxLayout(general_tab)
+        gl.addWidget(self.general_combo, 1)
+        general_apply = QPushButton('اجرای ابزار' if ui_lang == 'fa' else 'Apply tool')
+        general_apply.clicked.connect(lambda: self.apply_feature(self.general_actions, self.general_combo.currentIndex()))
+        gl.addWidget(general_apply)
+        self.tabs.addTab(general_tab, 'عمومی (۵۶)' if ui_lang == 'fa' else 'General (56)')
+
+        persian_tab = QWidget(self)
+        pl = QHBoxLayout(persian_tab)
+        pl.addWidget(self.persian_combo, 1)
+        persian_apply = QPushButton('اجرای ابزار' if ui_lang == 'fa' else 'Apply tool')
+        persian_apply.clicked.connect(lambda: self.apply_feature(self.persian_actions, self.persian_combo.currentIndex()))
+        pl.addWidget(persian_apply)
+        self.tabs.addTab(persian_tab, 'ویژه فارسی (۳۰)' if ui_lang == 'fa' else 'Persian (30)')
+        root.addWidget(self.tabs)
+
+        find_row = QHBoxLayout()
+        self.find_input = QLineEdit(self)
+        self.find_input.setPlaceholderText('عبارت برای یافتن' if ui_lang == 'fa' else 'Find text')
+        self.replace_input = QLineEdit(self)
+        self.replace_input.setPlaceholderText('جایگزین با' if ui_lang == 'fa' else 'Replace with')
+        replace_btn = QPushButton('جایگزینی همه' if ui_lang == 'fa' else 'Replace all')
+        replace_btn.clicked.connect(self.replace_all)
+        find_row.addWidget(self.find_input, 1)
+        find_row.addWidget(self.replace_input, 1)
+        find_row.addWidget(replace_btn)
+        root.addLayout(find_row)
+
+        buttons = QHBoxLayout()
+        actions = [
+            ('کپی' if ui_lang == 'fa' else 'Copy', self.copy_text),
+            ('چسباندن' if ui_lang == 'fa' else 'Paste', self.paste_text),
+            ('بازکردن فایل' if ui_lang == 'fa' else 'Import', self.import_text),
+            ('ذخیره فایل' if ui_lang == 'fa' else 'Export', self.export_text),
+            ('بازگشت' if ui_lang == 'fa' else 'Undo', self.editor.undo),
+            ('بازیابی' if ui_lang == 'fa' else 'Redo', self.editor.redo),
+            ('پاک‌کردن' if ui_lang == 'fa' else 'Clear', self.editor.clear),
+        ]
+        for label, callback in actions:
+            button = QPushButton(label, self)
+            button.clicked.connect(callback)
+            buttons.addWidget(button)
+        root.addLayout(buttons)
+        self.setLayoutDirection(Qt.RightToLeft if ui_lang == 'fa' else Qt.LeftToRight)
+
+    def apply_feature(self, actions, index):
+        if index < 0 or index >= len(actions):
+            return
+        label, func = actions[index]
+        try:
+            result = str(func(self.editor.toPlainText()))
+            self.editor.selectAll()
+            self.editor.insertPlainText(result)
+            self.editor.setFocus()
+        except Exception as exc:
+            QMessageBox.warning(self, 'خطا در ابزار' if self.ui_lang == 'fa' else 'Tool error', f'{label}\n{exc}')
+
+    def replace_all(self):
+        needle = self.find_input.text()
+        if not needle:
+            return
+        source = self.editor.toPlainText()
+        result = source.replace(needle, self.replace_input.text())
+        self.editor.selectAll()
+        self.editor.insertPlainText(result)
+
+    def copy_text(self):
+        QApplication.clipboard().setText(self.editor.toPlainText())
+
+    def paste_text(self):
+        self.editor.insertPlainText(QApplication.clipboard().text())
+
+    def import_text(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Open text', '', 'Text files (*.txt *.md *.csv *.json);;All files (*)')
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as handle:
+                self.editor.setPlainText(handle.read())
+        except Exception as exc:
+            QMessageBox.critical(self, 'Import error', str(exc))
+
+    def export_text(self):
+        path, _ = QFileDialog.getSaveFileName(self, 'Save text', 'transcript.txt', 'Text files (*.txt);;Markdown (*.md);;All files (*)')
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write(self.editor.toPlainText())
+        except Exception as exc:
+            QMessageBox.critical(self, 'Export error', str(exc))
+
+
+class DockDragHandle(QFrame):
+    clicked = pyqtSignal()
+    double_clicked = pyqtSignal()
+
+    def __init__(self, owner, text='🎙'):
+        super().__init__(owner)
+        self.owner = owner
+        self._press_global = None
+        self._last_global = None
+        self._moved = False
+        self._suppress_release = False
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(QApplication.doubleClickInterval())
+        self._click_timer.timeout.connect(self.clicked.emit)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setStyleSheet('QFrame {background:#26384c;border:1px solid #4b6682;border-radius:12px;}')
+        self.label = QLabel(text, self)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setStyleSheet('QLabel {color:white;font-size:17px;font-weight:bold;background:transparent;border:0;padding:3px;}')
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.addWidget(self.label)
+
+    def set_text(self, text):
+        self.label.setText(text)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._press_global = event.globalPos()
+            self._last_global = event.globalPos()
+            self._moved = False
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton and self._last_global is not None:
+            delta = event.globalPos() - self._last_global
+            if self._press_global is not None and (event.globalPos() - self._press_global).manhattanLength() >= QApplication.startDragDistance():
+                self._moved = True
+                self._click_timer.stop()
+            if self._moved:
+                self.owner.move(self.owner.pos() + delta)
+            self._last_global = event.globalPos()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.setCursor(Qt.OpenHandCursor)
+            if not self._moved and not self._suppress_release:
+                self._click_timer.start()
+            elif self._moved:
+                self.owner._on_handle_drag_finished()
+            self._suppress_release = False
+            self._press_global = None
+            self._last_global = None
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._click_timer.stop()
+            self._suppress_release = True
+            self._moved = True
+            self.double_clicked.emit()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+
+class FloatingDock(QWidget):
+    """آیکون شناور کوچک؛ بدون بازشدن با Hover و با ناحیه اختصاصی برای Drag."""
+    def __init__(self, main_window):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.main_window = main_window
+        self.expanded = False
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.root = QVBoxLayout(self)
+        self.root.setContentsMargins(2, 2, 2, 2)
+        self.root.setSpacing(4)
+        self.handle = DockDragHandle(self, '🎙')
+        self.handle.setFixedSize(52, 52)
+        self.handle.clicked.connect(self.toggle_expanded)
+        self.handle.double_clicked.connect(self.open_main_window)
+        self.root.addWidget(self.handle)
+
+        self.panel = QWidget(self)
+        self.panel.setStyleSheet('QWidget {background:rgba(20,28,40,245);border:1px solid #45617e;border-radius:12px;} QPushButton {color:white;background:#34495e;border:1px solid #52677e;border-radius:7px;padding:6px;} QPushButton:hover {background:#426080;}')
+        panel_layout = QVBoxLayout(self.panel)
+        panel_layout.setContentsMargins(8, 6, 8, 8)
+        panel_layout.setSpacing(6)
+        header = QHBoxLayout()
+        self.panel_title = QLabel('Vosk • کشیدن برای جابه‌جایی')
+        self.panel_title.setStyleSheet('color:#ecf0f1;background:transparent;border:0;font-size:11px;')
+        header.addWidget(self.panel_title, 1)
+        self.collapse_btn = QPushButton('⌄')
+        self.collapse_btn.setFixedSize(28, 24)
+        self.collapse_btn.clicked.connect(self.set_collapsed)
+        header.addWidget(self.collapse_btn)
+        panel_layout.addLayout(header)
+        controls = QHBoxLayout()
+        self.record_btn = QPushButton('🎤 شروع')
+        self.record_btn.clicked.connect(self.main_window.toggle_recording)
+        controls.addWidget(self.record_btn)
+        self.text_btn = QPushButton('📝 متن')
+        self.text_btn.clicked.connect(self.main_window.open_feature_workbench)
+        controls.addWidget(self.text_btn)
+        self.full_btn = QPushButton('پنجره کامل')
+        self.full_btn.clicked.connect(self.open_main_window)
+        controls.addWidget(self.full_btn)
+        panel_layout.addLayout(controls)
+        self.root.addWidget(self.panel)
+        self.panel.hide()
+        self.setFixedSize(58, 58)
+        self.setToolTip('کلیک: دسترسی سریع | دوبار کلیک: پنجره اصلی | کشیدن: جابه‌جایی')
+        self._restore_position()
+
+    def _restore_position(self):
+        settings = QSettings('MAADGH', 'VoskSpeechToText')
+        point = settings.value('floating_dock_pos')
+        if isinstance(point, QPoint):
+            self.move(point)
+        else:
+            screen = QApplication.primaryScreen()
+            if screen:
+                area = screen.availableGeometry()
+                self.move(area.right() - 70, area.center().y())
+        self._collapsed_pos = QPoint(self.pos())
+
+    def _save_position(self):
+        QSettings('MAADGH', 'VoskSpeechToText').setValue('floating_dock_pos', self.pos())
+
+    def _on_handle_drag_finished(self):
+        self._collapsed_pos = QPoint(self.pos())
+        self._save_position()
+
+    def toggle_expanded(self):
+        if self.expanded:
+            return
+        self._collapsed_pos = QPoint(self.pos())
+        self.expanded = True
+        self.handle.set_text('Vosk • برای جابه‌جایی بکشید')
+        self.handle.setFixedSize(260, 30)
+        self.panel.show()
+        self.setFixedSize(268, 118)
+        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+        if screen:
+            area = screen.availableGeometry()
+            x = min(max(self.x(), area.left()), area.right() - self.width() + 1)
+            y = min(max(self.y(), area.top()), area.bottom() - self.height() + 1)
+            self.move(x, y)
+
+    def set_collapsed(self):
+        self.expanded = False
+        self.panel.hide()
+        self.handle.set_text('🎙')
+        self.handle.setFixedSize(52, 52)
+        self.setFixedSize(58, 58)
+        if self._collapsed_pos is not None:
+            self.move(self._collapsed_pos)
+        self._collapsed_pos = QPoint(self.pos())
+        self._save_position()
+
+    def set_recording(self, active):
+        strings = UI_STRINGS.get(self.main_window.ui_lang, UI_STRINGS['en'])
+        self.record_btn.setText(strings['stop'] if active else strings['start'])
+
+    def open_main_window(self):
+        self.main_window.show_window()
+        self._save_position()
+
+
+# =============================================
 #  کلاس تشخیص گفتار
 # =============================================
 class SpeechRecognizer(QObject):
-    """Audio capture + Vosk recognition.
-
-    The audio thread never touches Qt widgets. stop() is deliberately non-blocking:
-    it signals the worker and closes the stream without join(), so the GUI remains
-    responsive when the user presses Stop repeatedly.
-    """
     text_ready = pyqtSignal(str)
+    partial_ready = pyqtSignal(str)
     error = pyqtSignal(str)
     stopped = pyqtSignal()
 
@@ -600,139 +1191,125 @@ class SpeechRecognizer(QObject):
         if not self.model_path:
             raise FileNotFoundError(f"مدل برای زبان {lang_code} پیدا نشد!")
         self.is_running = False
-        self.audio_queue = queue.Queue(maxsize=8)
-        # 8 blocks × 250 ms ≈ 2 seconds maximum buffered audio. A bounded
-        # queue prevents latency from growing without limit when CPU is busy.
+        self.audio_queue = queue.Queue(maxsize=16)
         self.model = None
         self.stream = None
         self._stop_event = threading.Event()
         self._thread = None
-        self._state_lock = threading.RLock()
+        self._lock = threading.RLock()
 
     def start(self):
-        with self._state_lock:
+        with self._lock:
             if self.is_running:
                 return
-            if not self.model:
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError('Previous audio session is still stopping; retry in a moment.')
+            current_path = find_model_path(self.lang_code)
+            if current_path:
+                self.model_path = current_path
+            if self.model is None:
                 self.model = Model(self.model_path)
-
             self._stop_event.clear()
+            self._clear_audio_queue()
             self.is_running = True
-            while True:
-                try:
-                    self.audio_queue.get_nowait()
-                except queue.Empty:
-                    break
-
-            self._thread = threading.Thread(
-                target=self._recognize_loop,
-                name="VoskRecognition",
-                daemon=True
-            )
+            self._thread = threading.Thread(target=self._recognize_loop, name='VoskAudioWorker', daemon=True)
             self._thread.start()
 
+    def _clear_audio_queue(self):
+        while True:
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def stop(self):
-        """Request stop and return immediately; never wait on the recognition thread."""
-        with self._state_lock:
-            self.is_running = False
+        with self._lock:
+            if not self.is_running and (self._thread is None or not self._thread.is_alive()):
+                return
             self._stop_event.set()
-            stream = self.stream
-
-        if stream is not None:
-            try:
-                stream.stop()
-            except Exception:
-                pass
-            try:
-                stream.close()
-            except Exception:
-                pass
-
-        # Do not join here. Joining from the GUI thread was the main source of
-        # the intermittent lag when Stop was pressed.
-        self._thread = None
+            self.is_running = False
+        # Stream is stopped/closed by the audio worker itself to avoid cross-thread races.
+        thread = self._thread
+        if thread is not None and thread.is_alive() and threading.current_thread() is not thread:
+            thread.join(timeout=2.5)
+        if thread is not None and not thread.is_alive():
+            self._thread = None
 
     def _recognize_loop(self):
-        stream = None
+        recognizer = None
         try:
             recognizer = KaldiRecognizer(self.model, 16000)
 
             def callback(indata, frames, time_info, status):
+                if status:
+                    print(f"Audio status: {status}")
                 if self._stop_event.is_set():
                     return
-                if status:
-                    # Do not print normal audio status messages in the console.
-                    pass
+                payload = bytes(indata)
                 try:
-                    self.audio_queue.put_nowait(bytes(indata))
+                    self.audio_queue.put_nowait(payload)
                 except queue.Full:
-                    # Dropping an old audio block is preferable to blocking
-                    # the PortAudio callback.
+                    # Drop the oldest block rather than allowing latency to grow without bound.
                     try:
                         self.audio_queue.get_nowait()
                     except queue.Empty:
                         pass
                     try:
-                        self.audio_queue.put_nowait(bytes(indata))
+                        self.audio_queue.put_nowait(payload)
                     except queue.Full:
                         pass
 
-            stream = sd.RawInputStream(
-                samplerate=16000,
-                channels=1,
-                dtype='int16',
-                callback=callback,
-                blocksize=4000,
-                latency='low'
+            self.stream = sd.RawInputStream(
+                samplerate=16000, channels=1, dtype='int16',
+                callback=callback, blocksize=4000
             )
-
-            with self._state_lock:
-                self.stream = stream
-
-            stream.start()
-
+            self.stream.start()
             while not self._stop_event.is_set():
                 try:
-                    data = self.audio_queue.get(timeout=0.10)
+                    data = self.audio_queue.get(timeout=0.15)
                 except queue.Empty:
                     continue
-
                 if recognizer.AcceptWaveform(data):
                     result = json.loads(recognizer.Result())
-                    text = result.get("text", "").strip()
-                    if text:
-                        self.text_ready.emit(text)
-
-            # Flush the last partial phrase so stopping does not silently lose it.
-            try:
+                    final_text = result.get('text', '').strip()
+                    if final_text:
+                        self.text_ready.emit(final_text)
+                else:
+                    partial = json.loads(recognizer.PartialResult()).get('partial', '').strip()
+                    if partial:
+                        self.partial_ready.emit(partial)
+            # Process blocks already captured before flushing the final utterance.
+            while True:
+                try:
+                    pending = self.audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if recognizer.AcceptWaveform(pending):
+                    pending_result = json.loads(recognizer.Result())
+                    pending_text = pending_result.get('text', '').strip()
+                    if pending_text:
+                        self.text_ready.emit(pending_text)
+            # Preserve the tail of the utterance when the user stops recording.
+            if recognizer is not None:
                 final_result = json.loads(recognizer.FinalResult())
-                final_text = final_result.get("text", "").strip()
+                final_text = final_result.get('text', '').strip()
                 if final_text:
                     self.text_ready.emit(final_text)
-            except Exception:
-                pass
-
-        except Exception as e:
-            if not self._stop_event.is_set():
-                self.error.emit(str(e))
+        except Exception as exc:
+            self.error.emit(str(exc))
         finally:
-            if stream is not None:
+            if self.stream is not None:
                 try:
-                    stream.stop()
+                    self.stream.stop()
                 except Exception:
                     pass
                 try:
-                    stream.close()
+                    self.stream.close()
                 except Exception:
                     pass
-
-            with self._state_lock:
-                if self.stream is stream:
-                    self.stream = None
-                self.is_running = False
-
+                self.stream = None
+            self.is_running = False
             self.stopped.emit()
-
 
 # =============================================
 #  تابع ساخت آیکون (جهت استفاده در برنامه و سینی)
@@ -778,7 +1355,7 @@ class FloatingWindow(QWidget):
         self.current_lang = 'fa'
         self.ui_lang = 'fa'
         self.timer_seconds = 0
-        self.timer = QTimer()
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.on_timer_tick)
         self.timer_mode = "off"
         self.models = fallback_model_catalog()
@@ -791,18 +1368,10 @@ class FloatingWindow(QWidget):
         self.model_wait_dialog = None
         self.model_manager_dialog = None
         self.drag_pos = None
-
-        # Lightweight persistent preferences. QSettings avoids another JSON
-        # file and is inexpensive for this small amount of state.
-        self.settings = QSettings("MAADGH", "VoskSpeechToText")
-        self.auto_type_enabled = self.settings.value("auto_type", True, type=bool)
-        self.hover_expand_enabled = self.settings.value("hover_expand", True, type=bool)
-        self.compact_mode = False
-        self._collapse_timer = QTimer(self)
-        self._collapse_timer.setSingleShot(True)
-        self._collapse_timer.timeout.connect(self._collapse_if_pointer_left)
-        self._cancel_model_load = False
-        self.model_loading = False
+        self.transcript_history = []
+        self.feature_dialog = None
+        self.dock = None
+        self._start_pending = False
 
         # اسپلش screen
         self.splash = QDialog(self)
@@ -814,6 +1383,7 @@ class FloatingWindow(QWidget):
         self.splash.setLayout(splash_layout)
         self.splash.setFixedSize(300, 150)
         self.splash.show()
+        QApplication.processEvents()
 
         self.init_ui()
         self.init_tray()
@@ -823,11 +1393,13 @@ class FloatingWindow(QWidget):
         self.hotkey_stop_requested.connect(self.stop_recording)
         self.setup_hotkeys()
 
-        # Never perform a blocking network check while constructing the GUI.
+        # Connectivity checks run in a worker so startup never blocks the GUI thread.
         self.is_online = False
         self.update_internet_status()
         self.refresh_language_list()
         self.check_internet_async()
+        self.dock = FloatingDock(self)
+        self.dock.show()
 
         self.internet_timer = QTimer(self)
         self.internet_timer.timeout.connect(self.check_internet_async)
@@ -1012,15 +1584,6 @@ class FloatingWindow(QWidget):
                 background: #27ae60;
                 border-radius: 8px;
             }
-            QPushButton#compact_button {
-                background: rgba(20, 20, 30, 235);
-                border: 1px solid #555;
-                border-radius: 29px;
-                padding: 4px;
-            }
-            QPushButton#compact_button:hover {
-                background: rgba(52, 152, 219, 235);
-            }
             #title_bar {
                 background: rgba(40, 40, 50, 80);
                 border-radius: 16px 16px 0 0;
@@ -1035,7 +1598,6 @@ class FloatingWindow(QWidget):
 
         # نوار عنوان
         title_bar = QFrame()
-        self.title_bar_widget = title_bar
         title_bar.setObjectName("title_bar")
         title_bar.setFixedHeight(40)
         title_bar_layout = QHBoxLayout(title_bar)
@@ -1052,6 +1614,13 @@ class FloatingWindow(QWidget):
         self.minimize_btn.setFixedSize(30, 30)
         self.minimize_btn.clicked.connect(self.minimize_to_tray)
         title_bar_layout.addWidget(self.minimize_btn)
+
+        self.dock_btn = QPushButton('◉')
+        self.dock_btn.setObjectName("minimize_btn")
+        self.dock_btn.setFixedSize(30, 30)
+        self.dock_btn.setToolTip('جمع‌کردن پنجره به آیکون شناور')
+        self.dock_btn.clicked.connect(self.collapse_to_dock)
+        title_bar_layout.addWidget(self.dock_btn)
 
         self.close_btn = QPushButton("✕")
         self.close_btn.setObjectName("close_btn")
@@ -1085,20 +1654,11 @@ class FloatingWindow(QWidget):
         self.manage_models_btn.clicked.connect(self.open_model_manager)
         top_layout.addWidget(self.manage_models_btn)
 
-        self.auto_type_checkbox = QCheckBox(strings['auto_type'])
-        self.auto_type_checkbox.setChecked(self.auto_type_enabled)
-        self.auto_type_checkbox.toggled.connect(self.set_auto_type)
-        top_layout.addWidget(self.auto_type_checkbox)
-
-        self.hover_expand_checkbox = QCheckBox(strings['hover_expand'])
-        self.hover_expand_checkbox.setChecked(self.hover_expand_enabled)
-        self.hover_expand_checkbox.toggled.connect(self.set_hover_expand)
-        top_layout.addWidget(self.hover_expand_checkbox)
-
-        self.compact_mode_checkbox = QCheckBox(strings['compact_mode'])
-        self.compact_mode_checkbox.setChecked(False)
-        self.compact_mode_checkbox.toggled.connect(lambda checked: self.enter_compact_mode() if checked else self.expand_from_compact())
-        top_layout.addWidget(self.compact_mode_checkbox)
+        self.features_btn = QPushButton('🧰 ابزارهای متن' if self.ui_lang == 'fa' else '🧰 Text tools')
+        self.features_btn.setToolTip('۵۶ ابزار عمومی + ۳۰ ابزار فارسی' if self.ui_lang == 'fa' else '56 general + 30 Persian tools')
+        self.features_btn.setStyleSheet('background:#6c5ce7;')
+        self.features_btn.clicked.connect(self.open_feature_workbench)
+        top_layout.addWidget(self.features_btn)
 
         self.internet_status_label = QLabel("🌐 " + strings['checking'])
         self.internet_status_label.setStyleSheet("color: #f1c40f; font-size: 11px;")
@@ -1124,8 +1684,7 @@ class FloatingWindow(QWidget):
         self.record_btn.clicked.connect(self.toggle_recording)
         control_layout.addWidget(self.record_btn)
 
-        self.timer_frame = QFrame()
-        timer_frame = self.timer_frame
+        timer_frame = QFrame()
         timer_frame.setStyleSheet("border: 1px solid #444; border-radius: 8px; padding: 2px;")
         timer_layout = QHBoxLayout(timer_frame)
         timer_layout.setSpacing(2)
@@ -1144,8 +1703,7 @@ class FloatingWindow(QWidget):
         timer_layout.addWidget(self.timer_plus_btn)
         control_layout.addWidget(timer_frame)
 
-        self.mode_frame = QFrame()
-        mode_frame = self.mode_frame
+        mode_frame = QFrame()
         mode_frame.setStyleSheet("border: 1px solid #444; border-radius: 8px; padding: 2px;")
         mode_layout = QHBoxLayout(mode_frame)
         mode_layout.setSpacing(4)
@@ -1180,27 +1738,11 @@ class FloatingWindow(QWidget):
         footer_layout.addWidget(link_label)
         footer_layout.addStretch()
 
-        # Compact floating-icon button. In compact mode this is the only
-        # visible control, giving a PiP-like always-on-top widget.
-        self.compact_button = QPushButton()
-        self.compact_button.setObjectName("compact_button")
-        self.compact_button.setIcon(QIcon(create_app_icon(48, 48)))
-        self.compact_button.setIconSize(QSize(48, 48))
-        self.compact_button.setFixedSize(58, 58)
-        self.compact_button.setToolTip(strings.get('compact_tooltip', strings['compact_mode']))
-        self.compact_button.clicked.connect(self.expand_from_compact)
-        self.compact_button.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.compact_button.customContextMenuRequested.connect(self.show_compact_menu)
-        self.compact_button.mousePressEvent = self.compact_mouse_press
-        self.compact_button.mouseMoveEvent = self.compact_mouse_move
-        self.compact_button.hide()
-
         # Main Layout
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(15, 10, 15, 10)
         main_layout.setSpacing(5)
         main_layout.addWidget(title_bar)
-        main_layout.addWidget(self.compact_button, 0, Qt.AlignCenter)
         main_layout.addLayout(top_layout)
         main_layout.addWidget(self.text_label)
         main_layout.addLayout(control_layout)
@@ -1209,9 +1751,32 @@ class FloatingWindow(QWidget):
         main_layout.addLayout(footer_layout)
         self.setLayout(main_layout)
         self.setFixedSize(820, 280)
-        self.apply_button_tooltips()
 
         self.apply_ui_direction()
+        if self.dock is not None:
+            self.dock.set_recording(self.is_recording)
+
+    def open_feature_workbench(self):
+        if self.feature_dialog is not None and self.feature_dialog.isVisible():
+            self.feature_dialog.raise_()
+            self.feature_dialog.activateWindow()
+            return
+        initial = '\n'.join(item['text'] for item in self.transcript_history[-200:])
+        self.feature_dialog = FeatureWorkbenchDialog(self, initial_text=initial, ui_lang=self.ui_lang)
+        self.feature_dialog.finished.connect(lambda _: setattr(self, 'feature_dialog', None))
+        self.feature_dialog.show()
+        self.feature_dialog.raise_()
+        self.feature_dialog.activateWindow()
+
+    def collapse_to_dock(self):
+        self.hide()
+        if self.dock is not None:
+            self.dock.show()
+            self.dock.raise_()
+
+    def on_partial_text(self, text):
+        if self.is_recording and text:
+            self.text_label.setText('… ' + text)
 
     def title_bar_mouse_press(self, event):
         if event.button() == Qt.LeftButton:
@@ -1222,37 +1787,6 @@ class FloatingWindow(QWidget):
             self.move(self.pos() + event.globalPos() - self.drag_pos)
             self.drag_pos = event.globalPos()
             event.accept()
-
-    def apply_button_tooltips(self):
-        # Qt ToolTip is the lightweight native equivalent of the editor-style
-        # hover hint the user requested. Text follows the selected UI language.
-        if self.ui_lang == 'fa':
-            tips = {
-                self.record_btn: '<b>شروع / توقف</b><br>شروع یا توقف دریافت صدا و تبدیل گفتار به متن.',
-                self.timer_minus_btn: '<b>کاهش زمان</b><br>۵ ثانیه از تایمر کم می‌کند.',
-                self.timer_plus_btn: '<b>افزایش زمان</b><br>۵ ثانیه به تایمر اضافه می‌کند.',
-                self.manage_models_btn: '<b>مدیریت مدل‌ها</b><br>دانلود، افزودن و حذف مدل‌های Vosk.',
-                self.minimize_btn: '<b>آیکون شناور</b><br>پنجره را به یک آیکون کوچک PiP مانند تبدیل می‌کند.',
-                self.close_btn: '<b>بستن</b><br>خروج کامل از برنامه.',
-                self.compact_mode_checkbox: '<b>حالت آیکون شناور</b><br>پنجره کوچک شناور را فعال یا غیرفعال می‌کند.',
-                self.hover_expand_checkbox: '<b>باز شدن با Hover</b><br>وقتی روی آیکون شناور بروید، پنجره باز می‌شود.',
-                self.auto_type_checkbox: '<b>تایپ خودکار</b><br>اگر خاموش باشد، متن فقط در کلیپ‌بورد قرار می‌گیرد و در برنامه مقصد تایپ نمی‌شود.'
-            }
-        else:
-            tips = {
-                self.record_btn: '<b>Start / Stop</b><br>Start or stop microphone speech recognition.',
-                self.timer_minus_btn: '<b>Decrease timer</b><br>Subtracts 5 seconds.',
-                self.timer_plus_btn: '<b>Increase timer</b><br>Adds 5 seconds.',
-                self.manage_models_btn: '<b>Model Manager</b><br>Download, add or delete Vosk models.',
-                self.minimize_btn: '<b>Floating icon</b><br>Turn the window into a small PiP-like floating icon.',
-                self.close_btn: '<b>Close</b><br>Exit the application.',
-                self.compact_mode_checkbox: '<b>Floating icon mode</b><br>Enable or disable the compact floating window.',
-                self.hover_expand_checkbox: '<b>Expand on hover</b><br>Open the window when hovering over the floating icon.',
-                self.auto_type_checkbox: '<b>Auto type</b><br>If disabled, recognized text is copied to the clipboard instead of being typed.'
-            }
-        for widget, tip in tips.items():
-            widget.setToolTip(tip)
-        self.compact_button.setToolTip(UI_STRINGS[self.ui_lang].get('compact_tooltip', 'Floating icon'))
 
     def apply_ui_direction(self):
         self.setLayoutDirection(Qt.RightToLeft if self.ui_lang == 'fa' else Qt.LeftToRight)
@@ -1274,10 +1808,8 @@ class FloatingWindow(QWidget):
         self.lang_selector_label.setText(strings['lang_selector'])
         self.ui_lang_label.setText(strings['ui_lang'])
         self.manage_models_btn.setText(strings['manage_models'])
-        self.auto_type_checkbox.setText(strings['auto_type'])
-        self.hover_expand_checkbox.setText(strings['hover_expand'])
-        if hasattr(self, 'compact_mode_checkbox'):
-            self.compact_mode_checkbox.setText(strings['compact_mode'])
+        if hasattr(self, 'features_btn'):
+            self.features_btn.setText('🧰 ابزارهای متن' if self.ui_lang == 'fa' else '🧰 Text tools')
         if hasattr(self, 'author_label'):
             self.author_label.setText(strings['author'])
         if hasattr(self, 'version_label'):
@@ -1301,20 +1833,19 @@ class FloatingWindow(QWidget):
         if idx >= 0:
             self.ui_lang_selector.setCurrentIndex(idx)
         self.ui_lang_selector.blockSignals(False)
-        if hasattr(self, 'compact_button'):
-            self.compact_button.setToolTip(strings.get('compact_tooltip', strings['compact_mode']))
         if hasattr(self, 'tray_show_action'):
             self.tray_show_action.setText(strings['tray_show'])
             self.tray_quit_action.setText(strings['tray_quit'])
-            self.tray_compact_action.setText(strings['compact_mode'])
-            self.tray_hover_action.setText(strings['hover_expand'])
-            self.tray_auto_type_action.setText(strings['auto_type'])
-        self.apply_button_tooltips()
         self.refresh_language_list()
         self.update_status_label()
         self.update_debug_label()
         self.update_internet_status()
         self.apply_ui_direction()
+        if self.dock is not None:
+            self.dock.set_recording(self.is_recording)
+            self.dock.text_btn.setText('📝 متن' if self.ui_lang == 'fa' else '📝 Text')
+            self.dock.full_btn.setText('پنجره کامل' if self.ui_lang == 'fa' else 'Full window')
+            self.dock.panel_title.setText('Vosk • برای جابه‌جایی بکشید' if self.ui_lang == 'fa' else 'Vosk • drag to move')
 
     def update_debug_label(self):
         strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
@@ -1385,7 +1916,7 @@ class FloatingWindow(QWidget):
             self.populate_models_table()
 
     def on_fetch_error(self, error):
-        pass  # Network errors are reflected in the UI; do not open/require a console.
+        print(f'Error fetching models: {error}')
         if not self.models:
             self.models = fallback_model_catalog()
         self._merge_installed_into_catalog()
@@ -1398,6 +1929,9 @@ class FloatingWindow(QWidget):
         current = self.current_lang
         by_lang = {}
         for meta in installed.values():
+            # Speaker-ID companion models are not standalone ASR language models.
+            if meta.get('lang') == 'spk':
+                continue
             by_lang.setdefault(meta['lang'], []).append(meta)
 
         self.lang_selector.blockSignals(True)
@@ -1447,7 +1981,7 @@ class FloatingWindow(QWidget):
             keyboard.add_hotkey('ctrl+shift+s', self.start_hotkey, suppress=False)
             keyboard.add_hotkey('ctrl+shift+x', self.stop_hotkey, suppress=False)
         except Exception as e:
-            self.text_label.setText(f'❌ Hotkey error: {e}') if hasattr(self, 'text_label') else None
+            print(f"Error setting hotkeys: {e}")
 
     def toggle_language_hotkey(self):
         self.hotkey_switch_requested.emit()
@@ -1533,389 +2067,188 @@ class FloatingWindow(QWidget):
         self.update_status_label()
 
     def toggle_recording(self):
-        if self.is_recording or self.model_loading or (
-            self.model_loader and self.model_loader.isRunning()
-        ):
-            self.stop_recording()
-        else:
+        if not self.is_recording:
             self.start_recording()
+        else:
+            self.stop_recording()
 
     def start_recording(self):
-        if self.is_recording:
+        if self.is_recording or (self.model_loader and self.model_loader.isRunning()):
             return
-        if self.model_loading:
-            return
-
         strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
         if not self.current_lang or not find_model_path(self.current_lang):
             self.text_label.setText(strings['no_model'])
             self.refresh_language_list()
             return
-
-        self._cancel_model_load = False
-        self.is_recording = True
-        self.model_loading = True
-        self.record_btn.setText(strings['stop'])
-        self.record_btn.setStyleSheet('background:#c0392b;color:white;')
-        self.text_label.setText(strings['wait_text'])
-
         try:
-            if (
-                self.recognizer is not None
-                and self.recognizer.lang_code == self.current_lang
-                and self.recognizer.model is not None
-            ):
-                self.model_loading = False
+            if self.recognizer is not None and self.recognizer.lang_code == self.current_lang and self.recognizer.model is not None:
                 self._finish_start_recording()
                 return
-
             self.recognizer = SpeechRecognizer(self.current_lang)
             self.recognizer.text_ready.connect(self.update_text)
+            self.recognizer.partial_ready.connect(self.on_partial_text)
             self.recognizer.error.connect(self.on_recognizer_error)
             self.recognizer.stopped.connect(self.on_recognizer_stopped)
-
+            self.model_wait_dialog = QProgressDialog(strings['wait_text'], '', 0, 0, self)
+            self.model_wait_dialog.setWindowTitle(strings['wait_title'])
+            self.model_wait_dialog.setCancelButton(None)
+            self.model_wait_dialog.setWindowModality(Qt.ApplicationModal)
+            self.model_wait_dialog.setMinimumDuration(0)
+            self.model_wait_dialog.show()
+            QApplication.processEvents()
+            self._start_pending = True
             self.model_loader = ModelLoadWorker(self.recognizer.model_path)
             self.model_loader.loaded.connect(self._model_loaded)
             self.model_loader.failed.connect(self._model_load_failed)
-            self.model_loader.finished.connect(self._model_loader_finished)
             self.model_loader.start()
-
         except Exception as e:
-            self.model_loading = False
-            self.is_recording = False
-            self.record_btn.setText(strings['start'])
-            self.record_btn.setStyleSheet("background:#2c3e50;color:white;")
             self.text_label.setText(f'❌ {e}')
+            self.is_recording = False
 
     def _model_loaded(self, model):
-        if self._cancel_model_load or not self.is_recording:
+        if not self._start_pending:
             return
+        self._start_pending = False
+        if self.model_wait_dialog:
+            self.model_wait_dialog.close()
+            self.model_wait_dialog = None
         if not self.recognizer:
             return
         self.recognizer.model = model
-        self.model_loading = False
         self._finish_start_recording()
 
     def _model_load_failed(self, error):
-        if self._cancel_model_load:
+        if not self._start_pending:
             return
-        self.model_loading = False
+        self._start_pending = False
+        if self.model_wait_dialog:
+            self.model_wait_dialog.close()
+            self.model_wait_dialog = None
         self.is_recording = False
-        strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
-        self.record_btn.setText(strings['start'])
-        self.record_btn.setStyleSheet("background:#2c3e50;color:white;")
         self.text_label.setText(f'❌ {error}')
-        self.update_status_label()
-
-    def _model_loader_finished(self):
-        # An old cancelled worker must never clear a newer worker reference.
-        sender = self.sender()
-        if sender is self.model_loader:
-            self.model_loading = False
-            self.model_loader = None
 
     def _finish_start_recording(self):
         strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
         try:
-            if self._cancel_model_load or not self.is_recording:
-                return
-
             self.recognizer.start()
             if not self.recognizer.is_running:
                 raise RuntimeError('Recognizer did not start')
-
-            self.model_loading = False
             self.is_recording = True
             self.record_btn.setText(strings['stop'])
             self.record_btn.setStyleSheet('background:#c0392b;color:white;')
+            if self.dock is not None:
+                self.dock.set_recording(True)
             self.text_label.setText(strings['recording'])
-
             if self.timer_seconds > 0 and self.timer_mode == 'off':
                 self.start_timer()
-
         except Exception as e:
-            self.model_loading = False
             self.is_recording = False
-            self.record_btn.setText(strings['start'])
-            self.record_btn.setStyleSheet("background:#2c3e50;color:white;")
             self.text_label.setText(f'❌ {e}')
 
     def on_recognizer_error(self, error):
-        self.model_loading = False
         self.is_recording = False
         strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
         self.record_btn.setText(strings['start'])
         self.record_btn.setStyleSheet("background: #2c3e50; color: white;")
+        if self.dock is not None:
+            self.dock.set_recording(False)
         self.text_label.setText(f'❌ Audio/recognition error: {error}')
+        self.stop_timer()
         self.update_status_label()
 
     def on_recognizer_stopped(self):
-        # Ignore an old stop signal if the same recognizer has already
-        # been started again.
-        if self.recognizer and self.recognizer.is_running:
-            return
-
-        if self.is_recording:
+        # Keep UI synchronized if the audio thread stops by itself.
+        if self.is_recording and (not self.recognizer or not self.recognizer.is_running):
             self.is_recording = False
-            self.model_loading = False
             strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
             self.record_btn.setText(strings['start'])
             self.record_btn.setStyleSheet("background: #2c3e50; color: white;")
+            if self.dock is not None:
+                self.dock.set_recording(False)
+            self.stop_timer()
             self.update_status_label()
 
     def stop_recording(self):
-        # Stop must be instantaneous from the GUI's perspective.
-        if not self.is_recording and not self.model_loading and not (
-            self.model_loader and self.model_loader.isRunning()
-        ):
+        if self._start_pending:
+            self._start_pending = False
+            if self.model_wait_dialog:
+                self.model_wait_dialog.close()
+                self.model_wait_dialog = None
+            self.text_label.setText(UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])['stopped'])
             return
-
-        self._cancel_model_load = True
-        self.model_loading = False
-        strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
-
-        if self.model_loader and self.model_loader.isRunning():
-            self.model_loader.requestInterruption()
-            # Model() itself cannot be forcibly interrupted safely. We simply
-            # ignore its result; the worker is allowed to finish in background.
+        if not self.is_recording:
+            return
         if self.recognizer:
             self.recognizer.stop()
-
         self.is_recording = False
+        strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
         self.record_btn.setText(strings['start'])
         self.record_btn.setStyleSheet("background: #2c3e50; color: white;")
+        if self.dock is not None:
+            self.dock.set_recording(False)
         self.text_label.setText(strings['stopped'])
         self.stop_timer()
-
         if self.timer_seconds > 0 and self.timer_mode == "on":
             self.start_timer()
 
-    def set_auto_type(self, enabled):
-        self.auto_type_enabled = bool(enabled)
-        self.settings.setValue("auto_type", self.auto_type_enabled)
-        if hasattr(self, 'tray_auto_type_action'):
-            self.tray_auto_type_action.setChecked(self.auto_type_enabled)
-        if hasattr(self, 'auto_type_checkbox') and self.auto_type_checkbox.isChecked() != self.auto_type_enabled:
-            self.auto_type_checkbox.blockSignals(True)
-            self.auto_type_checkbox.setChecked(self.auto_type_enabled)
-            self.auto_type_checkbox.blockSignals(False)
-
-    def set_hover_expand(self, enabled):
-        self.hover_expand_enabled = bool(enabled)
-        self.settings.setValue("hover_expand", self.hover_expand_enabled)
-        if hasattr(self, 'tray_hover_action'):
-            self.tray_hover_action.setChecked(self.hover_expand_enabled)
-        if hasattr(self, 'hover_expand_checkbox') and self.hover_expand_checkbox.isChecked() != self.hover_expand_enabled:
-            self.hover_expand_checkbox.blockSignals(True)
-            self.hover_expand_checkbox.setChecked(self.hover_expand_enabled)
-            self.hover_expand_checkbox.blockSignals(False)
-        if not self.hover_expand_enabled:
-            self._collapse_timer.stop()
-
-    def compact_mouse_press(self, event):
-        if event.button() == Qt.LeftButton:
-            self.drag_pos = event.globalPos()
-        event.accept()
-
-    def compact_mouse_move(self, event):
-        if event.buttons() == Qt.LeftButton and self.drag_pos is not None:
-            self.move(self.pos() + event.globalPos() - self.drag_pos)
-            self.drag_pos = event.globalPos()
-        event.accept()
-
-    def enterEvent(self, event):
-        # IMPORTANT: never collapse the normal window merely because the mouse
-        # leaves one of its child widgets. The old leaveEvent() did exactly
-        # that and caused the window to disappear while moving between buttons.
-        if self.compact_mode and self.hover_expand_enabled:
-            self._collapse_timer.stop()
-            self.expand_from_compact()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        # Intentionally no auto-collapse here. The user explicitly chooses
-        # compact mode; this prevents accidental disappearance.
-        super().leaveEvent(event)
-
-    def _collapse_if_pointer_left(self):
-        # Kept for compatibility with the existing timer, but never collapses
-        # the full window automatically.
-        return
-
-    def _screen_for_point(self, point):
-        screen = QApplication.screenAt(point)
-        if screen is None:
-            screen = QApplication.primaryScreen()
-        return screen
-
-    def _clamp_window_to_screen(self, widget=None):
-        widget = widget or self
-        center = widget.frameGeometry().center()
-        screen = self._screen_for_point(center)
-        if screen is None:
-            return
-        area = screen.availableGeometry()
-        x = max(area.left(), min(widget.x(), area.right() - widget.width() + 1))
-        y = max(area.top(), min(widget.y(), area.bottom() - widget.height() + 1))
-        widget.move(x, y)
-
-    def _place_compact_icon(self):
-        # Preserve the icon's center point when possible. If that point would
-        # put the icon outside the current monitor, clamp it to the monitor's
-        # available work area (taskbar excluded).
-        center = self.frameGeometry().center()
-        screen = self._screen_for_point(center)
-        if screen is None:
-            return
-        area = screen.availableGeometry()
-        size = 68
-        x = center.x() - size // 2
-        y = center.y() - size // 2
-        x = max(area.left(), min(x, area.right() - size + 1))
-        y = max(area.top(), min(y, area.bottom() - size + 1))
-        self.move(x, y)
-
-    def enter_compact_mode(self):
-        if self.compact_mode:
-            return
-
-        # Save the normal window centre before changing its geometry.
-        normal_center = self.frameGeometry().center()
-        self.compact_mode = True
-        self._collapse_timer.stop()
-
-        widgets = [
-            self.title_bar_widget if hasattr(self, 'title_bar_widget') else None,
-            self.lang_selector_label, self.lang_selector,
-            self.ui_lang_label, self.ui_lang_selector,
-            self.manage_models_btn, self.auto_type_checkbox,
-            self.hover_expand_checkbox, self.compact_mode_checkbox if hasattr(self, 'compact_mode_checkbox') else None,
-            self.internet_status_label, self.text_label, self.record_btn, self.timer_frame,
-            self.mode_frame, self.status_label, self.debug_label,
-            self.author_label, self.version_label
-        ]
-        for w in widgets:
-            if w is not None:
-                w.hide()
-
-        self.compact_button.setToolTip(self._compact_tooltip())
-        self.compact_button.show()
-        self.setFixedSize(68, 68)
-        # Use the icon centre rather than its top-left corner.
-        self.move(normal_center.x() - 34, normal_center.y() - 34)
-        self._clamp_window_to_screen(self)
-        if hasattr(self, 'tray_compact_action'):
-            self.tray_compact_action.setChecked(True)
-        if hasattr(self, 'compact_mode_checkbox'):
-            self.compact_mode_checkbox.blockSignals(True)
-            self.compact_mode_checkbox.setChecked(True)
-            self.compact_mode_checkbox.blockSignals(False)
-
-    def expand_from_compact(self):
-        if not self.compact_mode:
-            return
-
-        center = self.frameGeometry().center()
-        self.compact_mode = False
-        self.compact_button.hide()
-        if hasattr(self, 'tray_compact_action'):
-            self.tray_compact_action.setChecked(False)
-
-        widgets = [
-            self.title_bar_widget if hasattr(self, 'title_bar_widget') else None,
-            self.lang_selector_label, self.lang_selector,
-            self.ui_lang_label, self.ui_lang_selector,
-            self.manage_models_btn, self.auto_type_checkbox,
-            self.hover_expand_checkbox, self.compact_mode_checkbox if hasattr(self, 'compact_mode_checkbox') else None,
-            self.internet_status_label, self.text_label, self.record_btn, self.timer_frame,
-            self.mode_frame, self.status_label, self.debug_label,
-            self.author_label, self.version_label
-        ]
-        for w in widgets:
-            if w is not None:
-                w.show()
-
-        self.setFixedSize(820, 280)
-        self.move(center.x() - self.width() // 2, center.y() - self.height() // 2)
-        self._clamp_window_to_screen(self)
-        if hasattr(self, 'compact_mode_checkbox'):
-            self.compact_mode_checkbox.blockSignals(True)
-            self.compact_mode_checkbox.setChecked(False)
-            self.compact_mode_checkbox.blockSignals(False)
-
-    def _compact_tooltip(self):
-        if self.ui_lang == 'fa':
-            return '<b>آیکون شناور</b><br>کلیک: باز کردن پنجره<br>راست‌کلیک: منوی سریع<br>کشیدن: جابه‌جایی'
-        return '<b>Floating icon</b><br>Click: open window<br>Right-click: quick menu<br>Drag: move'
-
-    def show_compact_menu(self, pos):
-        menu = QMenu(self)
-        expand_action = QAction(UI_STRINGS[self.ui_lang]['expand_window'], self)
-        expand_action.triggered.connect(self.expand_from_compact)
-        menu.addAction(expand_action)
-
-        hover_action = QAction(UI_STRINGS[self.ui_lang]['hover_expand'], self)
-        hover_action.setCheckable(True)
-        hover_action.setChecked(self.hover_expand_enabled)
-        hover_action.triggered.connect(self.set_hover_expand)
-        menu.addAction(hover_action)
-
-        type_action = QAction(UI_STRINGS[self.ui_lang]['auto_type'], self)
-        type_action.setCheckable(True)
-        type_action.setChecked(self.auto_type_enabled)
-        type_action.triggered.connect(self.set_auto_type)
-        menu.addAction(type_action)
-
-        menu.addSeparator()
-        quit_action = QAction(UI_STRINGS[self.ui_lang]['tray_quit'], self)
-        quit_action.triggered.connect(self.quit_app)
-        menu.addAction(quit_action)
-        menu.exec_(self.compact_button.mapToGlobal(pos))
-
     def execute_command(self, text):
-        text_lower = text.lower().strip()
-        text_clean = text.strip()
-        strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
+        """Only execute an exact standalone voice command, never a substring in normal dictation."""
+        text_clean = re.sub(r'[\s،,.!?؟؛:]+$', '', str(text).strip().casefold())
+        text_clean = re.sub(r'^[\s،,.!?؟؛:]+', '', text_clean)
+        fa_normalized = text_clean.replace('ي', 'ی').replace('ك', 'ک')
 
         if self.current_lang == 'fa':
-            if any(x in text_clean for x in ["تغییر انگلیسی", "انگلیسی کن", "برو انگلیسی"]) or \
-               any(x in text_lower for x in ["change english", "switch to english", "english please"]):
+            if fa_normalized in {'تغییر انگلیسی', 'انگلیسی کن', 'برو انگلیسی', 'زبان انگلیسی'}:
                 for i in range(self.lang_selector.count()):
                     if self.lang_selector.itemData(i) == 'en':
                         self.lang_selector.setCurrentIndex(i)
                         break
-                self.text_label.setText(strings['cmd_lang_en'])
+                self.text_label.setText(UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])['cmd_lang_en'])
                 return True
         if self.current_lang == 'en':
-            if any(x in text_lower for x in [
-                "persian", "farsi", "persian change", "farsi change",
-                "change to persian", "change to farsi",
-                "switch to persian", "switch to farsi", "go persian"
-            ]):
+            if text_clean in {'persian', 'farsi', 'change to persian', 'change to farsi', 'switch to persian', 'switch to farsi', 'go persian'}:
                 for i in range(self.lang_selector.count()):
                     if self.lang_selector.itemData(i) == 'fa':
                         self.lang_selector.setCurrentIndex(i)
                         break
-                self.text_label.setText(strings['cmd_lang_fa'])
+                self.text_label.setText(UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])['cmd_lang_fa'])
                 return True
 
         commands = {
-            "delete all": self.cmd_delete_all,
-            "clear": self.cmd_delete_all,
-            "copy": self.cmd_copy,
-            "ctrl c": self.cmd_copy,
-            "paste": self.cmd_paste,
-            "ctrl v": self.cmd_paste,
-            "enter": self.cmd_enter,
-            "new line": self.cmd_enter,
-            "undo": self.cmd_undo,
-            "ctrl z": self.cmd_undo,
+            'delete all': self.cmd_delete_all,
+            'clear all': self.cmd_delete_all,
+            'clear': self.cmd_delete_all,
+            'copy': self.cmd_copy,
+            'copy text': self.cmd_copy,
+            'ctrl c': self.cmd_copy,
+            'paste': self.cmd_paste,
+            'paste text': self.cmd_paste,
+            'ctrl v': self.cmd_paste,
+            'enter': self.cmd_enter,
+            'new line': self.cmd_enter,
+            'next line': self.cmd_enter,
+            'stop recording': self.stop_recording,
+            'stop dictation': self.stop_recording,
+            'undo': self.cmd_undo,
+            'ctrl z': self.cmd_undo,
+            'پاک کن': self.cmd_delete_all,
+            'همه را پاک کن': self.cmd_delete_all,
+            'حذف همه': self.cmd_delete_all,
+            'کپی': self.cmd_copy,
+            'کپی کن': self.cmd_copy,
+            'چسباندن': self.cmd_paste,
+            'پیست کن': self.cmd_paste,
+            'خط جدید': self.cmd_enter,
+            'خط بعد': self.cmd_enter,
+            'توقف ضبط': self.stop_recording,
+            'توقف دیکته': self.stop_recording,
+            'برگرد': self.cmd_undo,
+            'واگرد': self.cmd_undo,
         }
-        for cmd, func in commands.items():
-            if cmd in text_lower:
-                func()
-                self.text_label.setText(f"⚡ {cmd}")
-                return True
+        func = commands.get(text_clean) or commands.get(fa_normalized)
+        if func is not None:
+            func()
+            return True
         return False
 
     def cmd_delete_all(self):
@@ -1946,23 +2279,22 @@ class FloatingWindow(QWidget):
 
     def update_text(self, text):
         strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
+        text = str(text).strip()
+        if not text:
+            return
         if self.execute_command(text):
             return
-        # Recognition signals arrive on the GUI thread. Never block it with
-        # keyboard.write(), especially for long Persian/English sentences.
-        QApplication.clipboard().setText(text)
-        if not self.auto_type_enabled:
+        self.transcript_history.append({'time': datetime.now().astimezone().isoformat(timespec='seconds'), 'text': text, 'lang': self.current_lang})
+        # Keep history bounded in memory; the workbench can export the latest 200 segments.
+        if len(self.transcript_history) > 1000:
+            self.transcript_history = self.transcript_history[-1000:]
+        try:
+            keyboard.write(text + ' ')
+            self.text_label.setText(f'📝 {text}')
+        except Exception as exc:
+            print(f'Type error: {exc}')
+            QApplication.clipboard().setText(text + ' ')
             self.text_label.setText(strings['clipboard_fallback'])
-            return
-
-        def type_text():
-            try:
-                keyboard.write(text + " ")
-            except Exception:
-                pass
-
-        threading.Thread(target=type_text, name="TextTyper", daemon=True).start()
-        self.text_label.setText(f"📝 {text}")
 
     # =====================
     #  مدیریت مدل‌ها
@@ -2258,7 +2590,7 @@ class FloatingWindow(QWidget):
 
     def update_download_eta(self, dlg, eta):
         strings = UI_STRINGS[self.ui_lang]
-        base = dlg.labelText().split('\n⏱')[0]
+        base = re.split(r'\n(?:زمان باقیمانده:|Time remaining:)', dlg.labelText())[0]
         dlg.setLabelText(base + '\n' + strings['eta'].format(time=eta))
 
     def on_download_finished(self, dlg, model_name, success, msg):
@@ -2343,6 +2675,7 @@ class FloatingWindow(QWidget):
         wait.setCancelButton(None)
         wait.setWindowModality(Qt.ApplicationModal)
         wait.show()
+        QApplication.processEvents()
         self.model_importer = LocalModelImporter(path, lang)
 
         def done(name, code, ok, msg):
@@ -2381,56 +2714,43 @@ class FloatingWindow(QWidget):
         self.tray_show_action.triggered.connect(self.show_window)
         self.tray_quit_action = QAction(strings['tray_quit'], self)
         self.tray_quit_action.triggered.connect(self.quit_app)
-        self.tray_compact_action = QAction(strings['compact_mode'], self)
-        self.tray_compact_action.setCheckable(True)
-        self.tray_compact_action.setChecked(self.compact_mode)
-        self.tray_compact_action.triggered.connect(
-            lambda checked: self.enter_compact_mode() if checked else self.expand_from_compact()
-        )
-
-        self.tray_hover_action = QAction(strings['hover_expand'], self)
-        self.tray_hover_action.setCheckable(True)
-        self.tray_hover_action.setChecked(self.hover_expand_enabled)
-        self.tray_hover_action.triggered.connect(self.set_hover_expand)
-
-        self.tray_auto_type_action = QAction(strings['auto_type'], self)
-        self.tray_auto_type_action.setCheckable(True)
-        self.tray_auto_type_action.setChecked(self.auto_type_enabled)
-        self.tray_auto_type_action.triggered.connect(self.set_auto_type)
-
         menu.addAction(self.tray_show_action)
-        menu.addAction(self.tray_compact_action)
-        menu.addAction(self.tray_hover_action)
-        menu.addAction(self.tray_auto_type_action)
-        menu.addSeparator()
         menu.addAction(self.tray_quit_action)
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(self.tray_icon_activated)
         self.tray_icon.show()
 
     def minimize_to_tray(self):
-        # Historical method name kept for compatibility. This is now a true
-        # floating PiP-style compact mode, not a taskbar/tray hide.
-        self.enter_compact_mode()
-        if hasattr(self, 'tray_compact_action'):
-            self.tray_compact_action.setChecked(True)
+        self.hide()
+        strings = UI_STRINGS.get(self.ui_lang, UI_STRINGS['en'])
+        self.tray_icon.showMessage(strings['app_title'], strings['tray_message'], QSystemTrayIcon.Information, 2000)
 
     def tray_icon_activated(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:
             self.show_window()
 
     def show_window(self):
-        if self.compact_mode:
-            self.expand_from_compact()
-        self.show()
+        self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def closeEvent(self, event):
+        # Closing the main window exits; the dock is only a quick-access companion.
+        self.quit_app()
+        event.accept()
 
     def quit_app(self):
         if self.recognizer:
             self.recognizer.stop()
-        if self.model_loader and self.model_loader.isRunning():
-            self.model_loader.requestInterruption()
+        for downloader in list(self.downloaders.values()):
+            try:
+                downloader.cancel()
+                if downloader.isRunning():
+                    downloader.wait(1500)
+            except Exception:
+                pass
+        if self.dock is not None:
+            self.dock.close()
         try:
             keyboard.unhook_all()
         except Exception:
@@ -2439,10 +2759,7 @@ class FloatingWindow(QWidget):
 
 # =============================================
 if __name__ == "__main__":
-    # Qt.Tool prevents a permanent normal taskbar button on Windows while
-    # the app remains available as an always-on-top floating window.
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
     # تنظیم آیکون برنامه با استفاده از تابع مستقل
     app_icon = QIcon(create_app_icon(64, 64))
     app.setWindowIcon(app_icon)
