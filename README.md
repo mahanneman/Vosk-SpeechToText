@@ -56,7 +56,7 @@ Works offline, supports 20+ languages, floats above all windows, and includes sm
 #### 1. Clone the repository
 =============================================
 
-git clone https://github.com/mahanneman/vosk-voice-typing.git
+git clone [https://github.com/mahanneman/vosk-voice-typing.git](https://github.com/mahanneman/Vosk-SpeechToText.git)
 cd vosk-voice-typing
 2. Install dependencies
 
