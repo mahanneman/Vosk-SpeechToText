@@ -51,7 +51,7 @@
 ### مراحل نصب
 
 #### ۱. دری
-git clone https://github.com/mahanneman/vosk-voice-typing.git
+git clone [https://github.com/mahanneman/vosk-voice-typing.git](https://github.com/mahanneman/Vosk-SpeechToText.git)
 cd vosk-voice-typing
 ۲. نصب وابستگی‌ها
 
